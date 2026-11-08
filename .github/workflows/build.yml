@@ -1,7 +1,7 @@
 name: Build
 on:
   push:
-    branches: [naive]
+    branches: [naive, codex/udp-over-quic]
     paths-ignore: [README.md]
   release:
     types: [published]
@@ -21,10 +21,15 @@ jobs:
           repository: caddyserver/caddy
           ref: ${{ env.CADDY_VERSION }}
           path: .caddy-bbr
-      - run: git -C .caddy-bbr apply "$GITHUB_WORKSPACE/caddy-sing-quic-bbrv1.patch" "$GITHUB_WORKSPACE/caddy-read-idle-timeout.patch"
+      - run: git -C .caddy-bbr apply "$GITHUB_WORKSPACE/caddy-sing-quic-bbrv1.patch" "$GITHUB_WORKSPACE/caddy-read-idle-timeout.patch" "$GITHUB_WORKSPACE/caddy-connect-udp.patch"
       - uses: actions/setup-go@v5
         with:
           go-version: ^1.26.x
+      - name: Test against patched Caddy
+        run: |
+          go work init "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.caddy-bbr"
+          XDG_CONFIG_HOME="$RUNNER_TEMP/udp-config" XDG_DATA_HOME="$RUNNER_TEMP/udp-data" go test -race -p 2 ./...
+          rm -f go.work go.work.sum
       - run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
       - run: ~/go/bin/xcaddy build "$CADDY_VERSION" --replace "github.com/caddyserver/caddy/v2=$GITHUB_WORKSPACE/.caddy-bbr" --with "github.com/caddyserver/forwardproxy=$GITHUB_WORKSPACE"
       - name: Pack naiveproxy assets
@@ -37,7 +42,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE }}.tar.xz caddy executable sha256 ${{ env.SHA256SUM }}
-          path: sha256sum.txt
+          path: |
+            sha256sum.txt
+            ${{ env.BUNDLE }}.tar.xz
       - name: Upload caddy assets
         if: ${{ github.event_name == 'release' }}
         run: gh release upload "${GITHUB_REF##*/}"  ${{ env.BUNDLE }}.tar.xz --clobber

@@ -1,0 +1,2 @@
+# Unified-diff context prefixes necessarily contain space followed by tabs.
+*.patch -whitespace

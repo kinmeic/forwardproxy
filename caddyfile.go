@@ -41,6 +41,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	}
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
+		case "udp":
+			if len(d.RemainingArgs()) != 0 || h.UDP != nil {
+				return d.ArgErr()
+			}
+			h.UDP = &UDPConfig{}
+
 		case "basic_auth":
 			args := d.RemainingArgs()
 			if len(args) != 2 {

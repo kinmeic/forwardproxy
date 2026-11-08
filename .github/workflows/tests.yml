@@ -1,35 +1,24 @@
-name: "Tests"
-
+name: Tests
 on:
   push:
-    branches:
-      - "master"
-      - "main"
-    paths-ignore:
-      - "**.md"
+    branches: [master, main, naive, codex/udp-over-quic]
+    paths-ignore: ['**.md']
   pull_request:
-    branches:
-      - "*"
-    paths-ignore:
-      - "**.md"
-
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  Tests:
+  tests:
     strategy:
+      fail-fast: false
       matrix:
-        go-version:
-          - 1.21.x
-          - 1.22.x
-        platform:
-          - ubuntu-latest
-          - windows-latest
+        platform: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
     steps:
-      - name: Fetch Repository
-        uses: actions/checkout@v4
-      - name: Install Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: '${{ matrix.go-version }}'
-      - name: Run test
-        run: go test -v -race ./...
+          go-version: ^1.26.x
+      - name: Build and test with production Caddy patches
+        run: ./scripts/build-udp-caddy.sh "$RUNNER_TEMP/udp-caddy"

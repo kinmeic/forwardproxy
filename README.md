@@ -266,3 +266,8 @@ Licensed under the [Apache License](LICENSE)
 USE AT YOUR OWN RISK. THIS IS DELIVERED AS-IS. By using this software, you agree and assert that authors, maintainers, and contributors of this software are not responsible or liable for any risks, costs, or problems you may encounter. Consider your threat model and be smart. If you find a flaw or bug, please submit a patch and help make things better!
 
 Initial version of this plugin was developed by Google. This is not an official Google product.
+
+## UDP over QUIC
+
+This branch supports opt-in authenticated HTTP/3 CONNECT-UDP using QUIC DATAGRAM.
+See [build, configuration and limits](docs/udp-over-quic.md).

@@ -1,0 +1,24 @@
+diff --git a/listeners.go b/listeners.go
+index 1877ac1..bbe31e6 100644
+--- a/listeners.go
++++ b/listeners.go
+@@ -481,6 +481,7 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
+ 			http3.ConfigureTLSConfig(quicTlsConfig),
+ 			&quic.Config{
+ 				InitialPacketSize: 1200,
++				EnableDatagrams: true,
+ 				Allow0RTT:         allow0rtt,
+ 				Tracer:            h3qlog.DefaultConnectionTracer,
+ 			},
+diff --git a/modules/caddyhttp/server.go b/modules/caddyhttp/server.go
+index 331bddc..1273a96 100644
+--- a/modules/caddyhttp/server.go
++++ b/modules/caddyhttp/server.go
+@@ -1070,6 +1070,7 @@ func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error
+ 			Handler:        s,
+ 			TLSConfig:      tlsCfg,
+ 			MaxHeaderBytes: s.MaxHeaderBytes,
++			EnableDatagrams: true,
+ 			// QUICConfig is deliberately unset: http3.Server only reads it when it
+ 			// creates its own listener (ListenAndServe/Serve). We bring our own
+ 			// listener and call ServeListener, so anything set here is ignored.

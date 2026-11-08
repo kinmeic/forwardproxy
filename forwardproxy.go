@@ -54,6 +54,10 @@ func init() {
 //
 // EXPERIMENTAL: This handler is still experimental and subject to breaking changes.
 type Handler struct {
+	// UDP enables authenticated HTTP/3 CONNECT-UDP using QUIC DATAGRAM.
+	UDP      *UDPConfig `json:"udp,omitempty"`
+	udpState *udpState
+
 	logger *zap.Logger
 
 	// Filename of the PAC file to serve.
@@ -119,6 +123,9 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision ensures that h is set up properly before use.
 func (h *Handler) Provision(ctx caddy.Context) error {
+	if err := h.provisionUDP(); err != nil {
+		return err
+	}
 	h.logger = ctx.Logger(h)
 
 	if h.DialTimeout <= 0 {
@@ -294,6 +301,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	if r.Method == http.MethodConnect {
+		if protocol := extendedConnectProtocol(r); protocol != "" {
+			if protocol != "connect-udp" {
+				return caddyhttp.Error(http.StatusNotImplemented, errors.New("unsupported Extended CONNECT protocol"))
+			}
+			return h.serveConnectUDP(w, r)
+		}
 		if r.ProtoMajor == 2 || r.ProtoMajor == 3 {
 			if len(r.URL.Scheme) > 0 || len(r.URL.Path) > 0 {
 				return caddyhttp.Error(http.StatusBadRequest,
