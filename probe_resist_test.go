@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -119,7 +120,7 @@ func TestGETAuthWrongProbeResistRedir(t *testing.T) {
 				t.Fatalf("Expected response: %d, Got: %d\n",
 					responseReference.StatusCode, responseProbeResist.StatusCode)
 			}
-			if err := responsesAreEqual(responseProbeResist, responseReference); err != nil {
+			if err := redirectResponsesAreEqual(responseProbeResist, responseReference, caddyForwardProxyProbeResist.addr, caddyDummyProbeResist.addr); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -138,7 +139,7 @@ func TestGETAuthWrongProbeResistRedir(t *testing.T) {
 				t.Fatalf("Expected response: %d, Got: %d\n",
 					responseReference.StatusCode, responseProbeResist.StatusCode)
 			}
-			if err = responsesAreEqual(responseProbeResist, responseReference); err != nil {
+			if err = redirectResponsesAreEqual(responseProbeResist, responseReference, caddyForwardProxyProbeResist.addr, caddyDummyProbeResist.addr); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -260,7 +261,7 @@ func TestConnectAuthWrongProbeResistRedir(t *testing.T) {
 					t.Fatalf("Expected response: %d, Got: %d\n",
 						responseReference.StatusCode, responseProbeResist.StatusCode)
 				}
-				if err = responsesAreEqual(responseProbeResist, responseReference); err != nil {
+				if err = redirectResponsesAreEqual(responseProbeResist, responseReference, caddyForwardProxyProbeResist.addr, caddyDummyProbeResist.addr); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -279,7 +280,7 @@ func TestConnectAuthWrongProbeResistRedir(t *testing.T) {
 					t.Fatalf("Expected response: %d, Got: %d\n",
 						responseReference.StatusCode, responseProbeResist.StatusCode)
 				}
-				if err = responsesAreEqual(responseProbeResist, responseReference); err != nil {
+				if err = redirectResponsesAreEqual(responseProbeResist, responseReference, caddyForwardProxyProbeResist.addr, caddyDummyProbeResist.addr); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -319,6 +320,41 @@ func (e errorHeaderAlternativeServiceNotEqual) CheckAlternativeServiceError(serv
 }
 
 // returns nil if are equal
+// Different proxy endpoints must redirect to their own HTTPS authority. Validate
+// each destination before normalizing only that expected host difference.
+func redirectResponsesAreEqual(a, b *http.Response, authorityA, authorityB string) error {
+	normalize := func(response *http.Response, authority string) (*http.Response, error) {
+		if response == nil {
+			return nil, errors.New("missing redirect response")
+		}
+		locations := response.Header.Values("Location")
+		if len(locations) != 1 {
+			return nil, errors.New("redirect must have one Location")
+		}
+		u, err := url.Parse(locations[0])
+		if err != nil {
+			return nil, err
+		}
+		if u.Scheme != "https" || u.Host != authority || u.User != nil {
+			return nil, fmt.Errorf("unexpected redirect destination %q", locations[0])
+		}
+		clone := *response
+		clone.Header = response.Header.Clone()
+		u.Host = "proxy.test"
+		clone.Header.Set("Location", u.String())
+		return &clone, nil
+	}
+	first, err := normalize(a, authorityA)
+	if err != nil {
+		return err
+	}
+	second, err := normalize(b, authorityB)
+	if err != nil {
+		return err
+	}
+	return responsesAreEqual(first, second)
+}
+
 func responsesAreEqual(res1, res2 *http.Response) error {
 	if res1 == nil {
 		return errors.New("res1 is nil")

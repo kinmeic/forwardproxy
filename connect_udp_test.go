@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
@@ -105,5 +106,62 @@ func TestUDPDialACLAndNoFragment(t *testing.T) {
 	defer c.Close()
 	if err = configureUDPNoFragment(c, false); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUDPRedirectComparison(t *testing.T) {
+	response := func(location string) *http.Response {
+		w := httptest.NewRecorder()
+		w.Header().Set("Location", location)
+		w.WriteHeader(307)
+		return w.Result()
+	}
+	if err := redirectResponsesAreEqual(response("https://a.test/path"), response("https://b.test/path"), "a.test", "b.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := redirectResponsesAreEqual(response("https://evil.test/path"), response("https://b.test/path"), "a.test", "b.test"); err == nil {
+		t.Fatal("incorrect redirect accepted")
+	}
+	if err := redirectResponsesAreEqual(response("https://a.test/other"), response("https://b.test/path"), "a.test", "b.test"); err == nil {
+		t.Fatal("path difference hidden")
+	}
+}
+
+// Exercise the legacy redirect fixtures on ordinary loopback as well, so this
+// regression can run on macOS without installing extra 127.x address aliases.
+func TestUDPRedirectIntegration(t *testing.T) {
+	for _, creds := range credentialsWrong {
+		for _, resource := range testResources {
+			for _, self := range []bool{false, true} {
+				targetA, targetB := caddyTestTarget.addr, caddyTestTarget.addr
+				if self {
+					targetA = caddyForwardProxyProbeResist.addr
+					targetB = caddyDummyProbeResist.addr
+				}
+				addrA := net.JoinHostPort("127.0.0.1", caddyForwardProxyProbeResist.httpRedirPort)
+				addrB := net.JoinHostPort("127.0.0.1", caddyDummyProbeResist.httpRedirPort)
+				for _, connect := range []bool{false, true} {
+					var a, b *http.Response
+					var err error
+					if connect {
+						a, err = connectAndGetViaProxy(targetA, resource, addrA, "HTTP/1.1", creds, "HTTP/1.1", false)
+						if err == nil {
+							b, err = connectAndGetViaProxy(targetB, resource, addrB, "HTTP/1.1", creds, "HTTP/1.1", false)
+						}
+					} else {
+						a, err = getViaProxy(targetA, resource, addrA, "HTTP/1.1", creds, false)
+						if err == nil {
+							b, err = getViaProxy(targetB, resource, addrB, "HTTP/1.1", creds, false)
+						}
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err = redirectResponsesAreEqual(a, b, caddyForwardProxyProbeResist.addr, caddyDummyProbeResist.addr); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+		}
 	}
 }
