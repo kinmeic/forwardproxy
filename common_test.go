@@ -162,22 +162,24 @@ func (c *caddyTestServer) server() *caddyhttp.Server {
 // For simulating/mimicing Caddy's built-in auto-HTTPS redirects. Super hacky but w/e.
 
 func (c *caddyTestServer) redirServer() *caddyhttp.Server {
-	return &caddyhttp.Server{
-		Listen: []string{":" + c.httpRedirPort},
-		Routes: caddyhttp.RouteList{
-			{
-				Handlers: []caddyhttp.MiddlewareHandler{
-					caddyhttp.StaticResponse{
-						StatusCode: caddyhttp.WeakString(strconv.Itoa(http.StatusPermanentRedirect)),
-						Headers: http.Header{
-							"Location":   []string{"https://" + c.addr + "/{http.request.uri}"},
-							"Connection": []string{"close"},
-						},
-						Close: true,
-					},
-				},
-			},
+	response := &caddyhttp.StaticResponse{
+		StatusCode: caddyhttp.WeakString(strconv.Itoa(http.StatusPermanentRedirect)),
+		Headers: http.Header{
+			"Location":   {"https://" + c.addr + "/{http.request.uri}"},
+			"Connection": {"close"},
 		},
+		Close: true,
+	}
+	return &caddyhttp.Server{
+		Listen:    []string{":" + c.httpRedirPort},
+		AutoHTTPS: &caddyhttp.AutoHTTPSConfig{Disabled: true},
+		Routes: caddyhttp.RouteList{{
+			// Handlers is runtime-only (json:"-"). TestMain serializes this
+			// server before loading it, so module handlers must use raw JSON.
+			HandlersRaw: []json.RawMessage{
+				caddyconfig.JSONModuleObject(response, "handler", "static_response", nil),
+			},
+		}},
 	}
 }
 
