@@ -23,11 +23,14 @@ CONNECT-UDP 的 probe resistance。Go UDP 单元和真实 HTTP/3 集成 `-race`
 通过，关键并发/限速回归重复五次通过；`go vet ./...` 和 patched Caddy
 构建通过。paired native 客户端真实 SOCKS/IPv4/IPv6/domain/empty/1200-byte/
 oversized recovery/source pinning/TCP padding 共存测试通过。macOS 本地只跑
-UDP Go 子集，完整 Linux Go 测试由分支 CI 执行。
+UDP Go 子集；本轮 [Linux 完整测试与 macOS UDP 测试](https://github.com/kinmeic/forwardproxy/actions/runs/42464763043)
+均已通过，且 [构建打包](https://github.com/kinmeic/forwardproxy/actions/runs/42464763057)
+成功。上述 CI 对应代码修复提交 `8b2ddbf`，后续文档提交未改代码。
 
 UDP over QUIC 不能宣称比 HTTPS 更隐蔽：CONNECT-UDP 元数据和 DATAGRAM
 内容受加密保护，但 Initial 可分析、包长/方向/时序可观察，主动连接可检查
-服务端能力。相比普通 TCP HTTPS，应按更大的传输分类/阻断面评估；相比
+服务端能力。相比普通 TCP HTTPS，存在独立的传输分类/阻断面；限制 UDP/QUIC
+的网络里阻断/不可用风险更高，不能泛化成任意防火墙的识别率。相比
 普通 HTTP/3，尚无定量依据证明更低风险。未开启 `probe_resistance` 的
 407 仍可暴露代理身份。本轮未做公网防火墙识别率测试。
 
