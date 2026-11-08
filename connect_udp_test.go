@@ -3,14 +3,21 @@ package forwardproxy
 import (
 	"bytes"
 	"context"
-	"github.com/caddyserver/caddy/v2"
+	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/sagernet/quic-go/http3"
+	"golang.org/x/time/rate"
 )
 
 func TestUDPTargetValidation(t *testing.T) {
@@ -81,10 +88,48 @@ func TestUDPAdmissionAndConfiguration(t *testing.T) {
 	if h.udpState.active != 0 {
 		t.Fatal("quota leaked")
 	}
-	for _, h := range []*Handler{{UDP: &UDPConfig{}}, {UDP: &UDPConfig{}, Upstream: "https://x", AuthCredentials: [][]byte{{1}}}, {UDP: &UDPConfig{IdleTimeout: caddy.Duration(time.Second)}, AuthCredentials: [][]byte{{1}}}} {
+	for _, h := range []*Handler{
+		{UDP: &UDPConfig{}},
+		{UDP: &UDPConfig{}, Upstream: "https://x", AuthCredentials: [][]byte{EncodeAuthCredentials("u", "p")}},
+		{UDP: &UDPConfig{IdleTimeout: caddy.Duration(time.Second)}, AuthCredentials: [][]byte{EncodeAuthCredentials("u", "p")}},
+		{UDP: &UDPConfig{}, AuthCredentials: [][]byte{[]byte("invalid base64")}},
+		{UDP: &UDPConfig{}, AuthCredentials: [][]byte{[]byte(base64.StdEncoding.EncodeToString([]byte("no-colon")))}},
+		{UDP: &UDPConfig{}, AuthCredentials: [][]byte{EncodeAuthCredentials("", "p")}},
+	} {
 		if h.provisionUDP() == nil {
 			t.Fatal("unsafe configuration accepted")
 		}
+	}
+}
+
+func TestUDPProbeResistance(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	h := &Handler{UDP: &UDPConfig{}, ProbeResistance: &ProbeResistance{}, AuthCredentials: [][]byte{EncodeAuthCredentials("u", "p")}}
+	if err := h.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, auth := range []string{"", "Basic dTpiYWQ=", "Basic %invalid", "Bearer token"} {
+		for _, path := range []string{"/.well-known/masque/udp/example.com/53/", "/invalid"} {
+			r := httptest.NewRequest("CONNECT", "https://proxy.test"+path, nil)
+			r = r.WithContext(context.WithValue(r.Context(), caddy.ReplacerCtxKey, caddy.NewReplacer()))
+			r.ProtoMajor, r.Proto = 3, "connect-udp"
+			r.Header.Set("Proxy-Authorization", auth)
+			// Deliberately omit Capsule-Protocol and the H3 writer interface:
+			// authentication hiding must run before capability/URI validation.
+			w := httptest.NewRecorder()
+			err := h.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				w.WriteHeader(http.StatusNotFound)
+				_, err := w.Write([]byte("ordinary site"))
+				return err
+			}))
+			if err != nil || w.Code != http.StatusNotFound || w.Body.String() != "ordinary site" || w.Header().Get("Proxy-Authenticate") != "" || w.Header().Get("Capsule-Protocol") != "" {
+				t.Fatalf("unauthenticated probe exposed proxy: status=%d headers=%v err=%v", w.Code, w.Header(), err)
+			}
+		}
+	}
+	if h.udpState.active != 0 || len(h.udpState.users) != 0 {
+		t.Fatal("unauthenticated probe acquired UDP resources")
 	}
 }
 func TestUDPVarintTruncation(t *testing.T) {
@@ -163,5 +208,143 @@ func TestUDPRedirectIntegration(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A peer may delay its control stream even after authenticating. Such a
+// request must consume admission quota until negotiation ends or is canceled.
+type pendingUDPWriter struct {
+	*httptest.ResponseRecorder
+	ready chan struct{}
+}
+
+func (w *pendingUDPWriter) HTTPStream() *http3.Stream         { panic("stream takeover before negotiation") }
+func (w *pendingUDPWriter) ReceivedSettings() <-chan struct{} { return w.ready }
+func (w *pendingUDPWriter) Settings() *http3.Settings         { return &http3.Settings{EnableDatagrams: true} }
+
+func TestUDPPendingSettingsAdmission(t *testing.T) {
+	h := &Handler{UDP: &UDPConfig{MaxSessions: 1}, AuthCredentials: [][]byte{EncodeAuthCredentials("u", "p")}}
+	if err := h.provisionUDP(); err != nil {
+		t.Fatal(err)
+	}
+	request := func(ctx context.Context) *http.Request {
+		r, _ := http.NewRequestWithContext(ctx, "CONNECT", "https://proxy.test/.well-known/masque/udp/example.com/53/", nil)
+		r.ProtoMajor = 3
+		r.Proto = "connect-udp"
+		r.Header.Set("Capsule-Protocol", "?1")
+		r.Header.Set("Proxy-Authorization", "Basic dTpw")
+		return r
+	}
+	writer := func() *pendingUDPWriter { return &pendingUDPWriter{httptest.NewRecorder(), make(chan struct{})} }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.serveConnectUDP(writer(), request(ctx)) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		h.udpState.Lock()
+		active := h.udpState.active
+		h.udpState.Unlock()
+		if active == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("SETTINGS waiter did not acquire quota")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	second, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer stop()
+	err := h.serveConnectUDP(writer(), request(second))
+	var handlerErr caddyhttp.HandlerError
+	if !errors.As(err, &handlerErr) || handlerErr.StatusCode != 429 {
+		t.Fatalf("expected quota rejection, got %v", err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SETTINGS cancellation leaked request")
+	}
+	h.udpState.Lock()
+	active := h.udpState.active
+	h.udpState.Unlock()
+	if active != 0 {
+		t.Fatal("SETTINGS cancellation leaked quota")
+	}
+}
+
+func TestUDPUnknownContextConsumesRate(t *testing.T) {
+	limiter := rate.NewLimiter(0, 1)
+	stats := new(udpRelayStats)
+	touched := false
+	touch := func() { touched = true }
+	// Nil UDP is intentional: neither the unknown frame nor the next, now
+	// rate-limited valid frame may reach the socket.
+	if err := forwardUDPDatagram(nil, []byte{1}, limiter, stats, touch); err != nil {
+		t.Fatal(err)
+	}
+	if err := forwardUDPDatagram(nil, []byte{0, 'x'}, limiter, stats, touch); err != nil {
+		t.Fatal(err)
+	}
+	if touched || stats.sent.Load() != 0 || stats.dropped.Load() != 2 {
+		t.Fatal("unknown context bypassed packet budget")
+	}
+}
+
+func TestUDPCapsuleFloodAndTruncation(t *testing.T) {
+	stats := new(udpRelayStats)
+	for _, packet := range [][]byte{{0x40}, {0}, {0, 0}, {0, 1}} {
+		if err := readUDPCapsules(bytes.NewReader(packet), nil, rate.NewLimiter(0, 1), stats, func() {}); err == nil {
+			t.Fatalf("accepted truncated/malformed capsule %x", packet)
+		}
+	}
+	// Each unknown capsule is type=1, length=0. Its lack of payload must not
+	// allow unlimited control processing while bypassing business packet limits.
+	packet := bytes.Repeat([]byte{1, 0}, 10000)
+	err := readUDPCapsules(bytes.NewReader(packet), nil, rate.NewLimiter(0, 1), stats, func() {})
+	if err == nil || !strings.Contains(err.Error(), "rate exceeded") {
+		t.Fatalf("unbounded control processing: %v", err)
+	}
+}
+
+func TestUDPPrivateAddressPolicy(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	h := &Handler{}
+	if err := h.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, ip := range []string{"fd00::1", "fc00::1", "169.254.169.254"} {
+		if h.hostIsAllowed(ip, net.ParseIP(ip)) {
+			t.Fatalf("default ACL allows private/link-local %s", ip)
+		}
+	}
+	// Explicit administrator rules retain precedence over the default deny list.
+	allowed := &Handler{ACL: []ACLRule{{Allow: true, Subjects: []string{"fd00::/8"}}}}
+	if err := allowed.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !allowed.hostIsAllowed("fd00::1", net.ParseIP("fd00::1")) {
+		t.Fatal("explicit private network allow was ignored")
+	}
+}
+
+func TestUDPActivityDoesNotRegress(t *testing.T) {
+	a := newUDPActivity()
+	a.record(2 * time.Second)
+	a.record(time.Second)
+	if a.last.Load() != int64(2*time.Second) {
+		t.Fatal("stale relay activity overwrote a newer timestamp")
+	}
+	// Shift the monotonic start rather than change the system clock or sleep.
+	a.start = time.Now().Add(-time.Minute)
+	a.last.Store(0)
+	if a.inactiveFor() < time.Minute {
+		t.Fatal("idle elapsed duration lost")
+	}
+	a.touch()
+	if a.inactiveFor() > time.Second {
+		t.Fatal("recent activity did not refresh monotonic idle timer")
 	}
 }

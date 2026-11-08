@@ -2,6 +2,7 @@ package forwardproxy
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -54,6 +55,12 @@ func (h *Handler) provisionUDP() error {
 	}
 	if h.Upstream != "" {
 		return errors.New("udp does not support upstream proxy chaining")
+	}
+	for _, credential := range h.AuthCredentials {
+		decoded, err := base64.StdEncoding.DecodeString(string(credential))
+		if err != nil || strings.IndexByte(string(decoded), ':') <= 0 {
+			return errors.New("udp requires valid Basic credentials with a non-empty username")
+		}
 	}
 	c := h.UDP
 	if c.IdleTimeout == 0 {
@@ -198,6 +205,16 @@ func (h *Handler) serveConnectUDP(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return caddyhttp.Error(400, err)
 	}
+	_, credential, present := strings.Cut(r.Header.Get("Proxy-Authorization"), " ")
+	if !present || credential == "" {
+		return caddyhttp.Error(407, errors.New("proxy authentication required"))
+	}
+	// Identity is a validated, configured Basic credential, never logged.
+	user, release, ok := h.admitUDP(credential)
+	if !ok {
+		return caddyhttp.Error(429, errors.New("UDP session limit"))
+	}
+	defer release()
 	transport, settings := unwrapHTTP3(w)
 	if transport == nil {
 		return caddyhttp.Error(501, errors.New("Caddy HTTP/3 DATAGRAM patch required"))
@@ -214,12 +231,6 @@ func (h *Handler) serveConnectUDP(w http.ResponseWriter, r *http.Request) error 
 	if !settings.Settings().EnableDatagrams {
 		return caddyhttp.Error(501, errors.New("peer did not enable H3 DATAGRAM"))
 	}
-	// Identity is a validated, configured Basic credential, never logged.
-	user, release, ok := h.admitUDP(strings.SplitN(r.Header.Get("Proxy-Authorization"), " ", 2)[1])
-	if !ok {
-		return caddyhttp.Error(429, errors.New("UDP session limit"))
-	}
-	defer release()
 	udp, err := h.dialUDP(r.Context(), host, port)
 	if err != nil {
 		return err
@@ -256,11 +267,10 @@ type udpRelayStats struct{ sent, received, dropped atomic.Uint64 }
 func relayUDP(parent context.Context, udp *net.UDPConn, stream *http3.Stream, idle time.Duration, limiter *rate.Limiter, stats *udpRelayStats) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	var last atomic.Int64
-	last.Store(time.Now().UnixNano())
-	touch := func() { last.Store(time.Now().UnixNano()) }
+	activity := newUDPActivity()
+	touch := activity.touch
 	errorsCh := make(chan error, 3)
-	go func() { errorsCh <- readUDPCapsules(stream, udp, limiter, touch) }()
+	go func() { errorsCh <- readUDPCapsules(stream, udp, limiter, stats, touch) }()
 	go func() {
 		for {
 			packet, err := stream.ReceiveDatagram(ctx)
@@ -268,26 +278,10 @@ func relayUDP(parent context.Context, udp *net.UDPConn, stream *http3.Stream, id
 				errorsCh <- err
 				return
 			}
-			payload, known, err := decodeUDPDatagram(packet)
-			if err != nil {
+			if err = forwardUDPDatagram(udp, packet, limiter, stats, touch); err != nil {
 				errorsCh <- err
 				return
 			}
-			if !known || !limiter.Allow() {
-				stats.dropped.Add(1)
-				continue
-			}
-			_, err = udp.Write(payload)
-			if err != nil {
-				if isUDPTooLarge(err) {
-					stats.dropped.Add(1)
-					continue
-				}
-				errorsCh <- err
-				return
-			}
-			stats.sent.Add(1)
-			touch()
 		}
 	}()
 	go func() {
@@ -331,7 +325,7 @@ func relayUDP(parent context.Context, udp *net.UDPConn, stream *http3.Stream, id
 			result = parent.Err()
 			active = false
 		case <-ticker.C:
-			if time.Since(time.Unix(0, last.Load())) >= idle {
+			if activity.inactiveFor() >= idle {
 				result = context.DeadlineExceeded
 				active = false
 			}
@@ -387,14 +381,19 @@ func decodeUDPDatagram(packet []byte) ([]byte, bool, error) {
 	}
 	return packet[n:], true, nil
 }
-func readUDPCapsules(r io.Reader, udp *net.UDPConn, limiter *rate.Limiter, touch func()) error {
+func readUDPCapsules(r io.Reader, udp *net.UDPConn, limiter *rate.Limiter, stats *udpRelayStats, touch func()) error {
 	// Bound memory for control frames. There is no send-side Capsule fallback;
 	// accepting peer DATAGRAM capsules preserves RFC 9297 interoperability.
 	buf := make([]byte, 65536)
+	controlRate := rate.NewLimiter(100, 100)
 	for {
 		typ, err := readVarint(r)
 		if err != nil {
 			return err
+		}
+		// Unknown or empty capsules must not bypass all processing limits.
+		if !controlRate.Allow() {
+			return errors.New("capsule processing rate exceeded")
 		}
 		length, err := readVarint(r)
 		if err != nil {
@@ -409,21 +408,59 @@ func readUDPCapsules(r io.Reader, udp *net.UDPConn, limiter *rate.Limiter, touch
 		if typ != 0 {
 			continue
 		}
-		payload, known, err := decodeUDPDatagram(buf[:length])
-		if err != nil {
+		if err = forwardUDPDatagram(udp, buf[:length], limiter, stats, touch); err != nil {
 			return err
 		}
-		if !known || !limiter.Allow() {
-			continue
-		}
-		if _, err = udp.Write(payload); err != nil {
-			if isUDPTooLarge(err) {
-				continue
-			}
-			return err
-		}
-		touch()
 	}
 }
 
 func isUDPTooLarge(err error) bool { return errors.Is(err, syscall.EMSGSIZE) }
+
+// Durations are relative to a monotonic start time, independent of wall-clock
+// adjustments. Atomic durations allow both relay directions to report activity.
+type udpActivity struct {
+	start time.Time
+	last  atomic.Int64
+}
+
+func newUDPActivity() *udpActivity { return &udpActivity{start: time.Now()} }
+func (a *udpActivity) touch()      { a.record(time.Since(a.start)) }
+func (a *udpActivity) record(elapsed time.Duration) {
+	// A preempted sender must not overwrite a more recent receiver timestamp.
+	for previous := a.last.Load(); int64(elapsed) > previous; previous = a.last.Load() {
+		if a.last.CompareAndSwap(previous, int64(elapsed)) {
+			return
+		}
+	}
+}
+func (a *udpActivity) inactiveFor() time.Duration {
+	return time.Since(a.start) - time.Duration(a.last.Load())
+}
+
+func forwardUDPDatagram(udp *net.UDPConn, packet []byte, limiter *rate.Limiter, stats *udpRelayStats, touch func()) error {
+	payload, known, err := decodeUDPDatagram(packet)
+	if err != nil {
+		return err
+	}
+	// Always charge the packet, including unknown contexts. Short-circuiting
+	// the Allow call on !known would permit unmetered processing of such traffic.
+	allowed := limiter.Allow()
+	if !known || !allowed {
+		stats.dropped.Add(1)
+		return nil
+	}
+	n, err := udp.Write(payload)
+	if err != nil {
+		if isUDPTooLarge(err) {
+			stats.dropped.Add(1)
+			return nil
+		}
+		return err
+	}
+	if n != len(payload) {
+		return io.ErrShortWrite
+	}
+	stats.sent.Add(1)
+	touch()
+	return nil
+}

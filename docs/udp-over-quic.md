@@ -56,13 +56,18 @@ For tuning, the handler's JSON `udp` object supports:
 
 There is also a process-wide 4096-session cap and a handler-wide setup limiter
 of 100 sessions/second with burst 200. Quotas include requests still resolving
-DNS. On close, debug logs contain duration, packet/drop counts and the reason;
+DNS or waiting for peer SETTINGS. Unknown Context IDs consume packet budget too.
+Control Capsule processing additionally has a per-tunnel 100/s limit (burst 100);
+exceeding it closes the tunnel. On close, debug logs contain duration, packet/drop counts and the reason;
 credentials and UDP payloads are never included in those logs.
 
 Both IPv4 and IPv6 targets are supported. Domains resolve at the server with a
 bounded, cancelable lookup. The selected IP is checked and dialed directly, so
 there is no second lookup between ACL validation and dial. Connected UDP accepts
 only replies from that target. Source IP/port changes at a target are not relayed.
+Default ACLs deny IPv4 link-local and IPv6 ULA as well as the existing private
+ranges. Explicit administrator allow rules retain precedence. Configured Basic
+credentials must be valid Base64 `username:password` with a non-empty username.
 
 ## Client
 
@@ -94,8 +99,10 @@ packets are dropped without closing a healthy tunnel. The proxy configures DF /
 no-fragment sockets on Linux and macOS. A 1200-byte inner QUIC Initial requires
 more than 1200 bytes of outer capacity: not every path can carry it. There is no
 application fragmentation extension. Datagram padding is not enabled; TCP Naive
-padding remains independent. DATAGRAM capability advertisement changes the
-connection's observable profile and does not establish browser equivalence.
+padding remains independent. The server's DATAGRAM capability advertisement
+changes its negotiation profile; this is observable by a connecting peer, while
+SETTINGS are encrypted from passive observers. It does not establish browser
+equivalence. See the [audit and traffic-risk assessment](udp-over-quic-audit.zh-CN.md).
 
 FIN/RESET, cancellation, UDP socket errors and inactivity all close the socket,
 cancel all relay tasks and release quotas. A disconnected client rebuilds a
